@@ -1,0 +1,1059 @@
+---
+title: "HPP Modeling Project Report"
+author: "Luke Qian & Beau Galasong"
+date: "`r Sys.Date()`"
+editor_options: 
+  chunk_output_type: console
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    theme: cerulean
+    highlight: pygments
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, tidy.opts = list(width.cutoff = 60), tidy = TRUE)
+```
+# 1. Load packages for data preprocessing
+```{r}
+library(tidyverse)
+library(readr)
+```
+
+# 2. Load data
+```{r}
+hpp_df <- read_csv("validation.csv", na = "empty", col_types = cols(
+  pH = col_double(), 
+  WaterActivity = col_double(), 
+  Brix = col_double(), 
+  Date = col_date(format = "%m/%d/%Y")))
+```
+
+Check product category distribution
+```{r, warning=FALSE}
+# check the data structure
+skimr::skim(hpp_df)
+
+# summarize the number of data points for each product
+product_freq <- hpp_df %>% 
+   group_by(Product, Category) %>% 
+   summarise(n_data_points = n()) 
+
+# summarize category frequency
+category_freq <- data.frame(table(product_freq$Category)) %>%
+  mutate(Frequency = Freq/sum(Freq)) %>%
+  rename(Category = Var1, Count = Freq)
+
+category_freq
+
+```
+
+Takeaway: Categories should be combined before modeling.
+```{r eval=FALSE, include=FALSE}
+# subset a dataset for predicting the log reduction
+logRed_df = hpp_df %>%
+  filter(Time == "Before HPP")
+
+skimr::skim(logRed_df)
+```
+
+# 3. Data preprocessing
+```{r}
+# Prepare dataset for logistic regression
+# Make sure that package MASS is not loaded while doing this.
+# If MASS is loaded, the function select() would not work.
+hpp_df_logis <- hpp_df %>% 
+  select(!(Date)) %>%
+  filter(Time %in% c("BeforeHPP", "AfterHPP")) %>%
+  pivot_wider(names_from = Time, 
+              values_from = c(Ecoli, Salmonella, Lmonocytogenes)) %>%
+  mutate(LR_Ecoli = Ecoli_BeforeHPP-Ecoli_AfterHPP,
+         LR_Salmonella = Salmonella_BeforeHPP-Salmonella_AfterHPP,
+         LR_Lmonocytogenes = Lmonocytogenes_BeforeHPP - Lmonocytogenes_AfterHPP) %>%
+  
+  # Further categorize post-HPP plate counts to 
+      #1) nondetects (recorded as 0) - "passed"
+      #2) detected with 5 log reduction achieved 
+      #3) detected with 5 log reduction NOT achieved - "failed"
+  mutate(
+    PassLmono = case_when(
+    Lmonocytogenes_AfterHPP == 0 ~ "PassNonDetected",
+    eval(LR_Lmonocytogenes < 5) ~ "Failed",
+    .default = "PassDetected")) %>%
+  mutate(
+    PassEcoli = case_when(
+    Ecoli_AfterHPP == 0 ~ "PassNonDetected",
+    LR_Ecoli < 5 ~ "Failed",
+    .default = "PassDetected")) %>%
+  mutate(
+    PassSalmonella = case_when(
+    Salmonella_AfterHPP == 0 ~ "PassNonDetected",
+    LR_Salmonella < 5 ~ "Failed",
+    .default = "PassDetected")) %>%
+
+  # Convert Dwell Time & Processing Temp to categorical variables
+  # because the validation center is usually specific about these   # two parameters. Pressure remains a numercial variable because
+  # the center ran more diverse temperature than time & temp.
+  mutate(DwellTimeRange = case_when(
+    `DwellTime(s)`< 90 ~ "Under 90 s",
+    `DwellTime(s)`>=90 & `DwellTime(s)`<180 ~ "Between 90-179 s",
+    `DwellTime(s)`== 180 ~ " 180 s",
+    `DwellTime(s)`> 180 ~ " Over 180 s"),
+  #, ProcessingTemperature = case_when(
+  #   `ProcessingTemp(degC)` == 5 ~ "5 degrees C",
+  #   `ProcessingTemp(degC)`> 5 & `ProcessingTemp(degC)`<= 10 ~ "Between 5-10 degrees C",
+  #   `ProcessingTemp(degC)`>10 ~ "Above 10 degrees C"),
+  # Pressure = case_when(
+  #   `Pressure(psi)`<= 80000 ~ "Between 50,000 to 80,000 psi",
+  #   `Pressure(psi)` > 80000 ~ "Between 80,0001 to 87,000 psi"),
+   .keep = "unused") %>%
+    mutate(MainCategory = case_when(
+    Category == "almond milk" | Category == "lactose-free non-dairy beverage" ~ "Dairy alternatives (including nut and eggs)",
+    # Combine sub-categories 
+    Category == "apple cider (non-alcoholic)" | Category == "apple juice" | Category == "celery juice" |
+    Category == "cherry juice" |
+    Category == "citrus juice" |
+    Category == "coconut water" |
+    Category == "grape juice" |
+    Category == "grapefruit juice" |
+    Category == "mixed fruit and vegetable juices" |
+    Category == "orange juice" |
+    Category == "watermelon juice" ~ "Juices and Non-alcoholic Ciders",
+    Category == "gazpacho" |
+    Category == "fruit or fruit-vegetable puree" |
+    Category == "fruit puree" |
+    Category == "fruit smoothies" |
+    Category == "mango food product" |
+    Category == "fruit salad" ~ "Fruit and Vegetable Purees or Smoothies",
+    Category == "barbeque sauce" |
+     Category == "harissa chili paste"|
+     Category == "herbs, vegetables and oil sauces" |
+     Category == "salsa" |
+     Category == "indian chutney" |
+     Category == "marinara sauce" |
+     Category == "pesto sauce" |
+     Category == "sauce" |
+     Category == "seasoning (citrus juice based)" |
+     Category == "vinaigrette dressing food product" ~ "Sauces, Salsas, Vinaigrettes and Marinades",
+Category == "bean (cooked)" |
+Category == "dip (nondairy)" |
+Category == "hummus"  ~ "Hummus and other bean dips",
+Category == "coffee beverage"|
+Category == "tea based beverage product" ~ "Coffee- and Tea-based Beverages",
+Category =="crabmeat (cooked)" | 
+  Category == "meat (cured)"|
+  Category == "pancetta"|
+  Category == "plant based meat product analog" ~ "Meat, Seafood, or Analogs",
+Category == "tuna salad"| 
+  Category == "prepared pasta salad"|
+  Category == "meal (ready-to-consume)" ~ "RTE Meal or Salad",
+Category == "vegetable and meat infant food" | 
+Category == "infant food (pureed)"~ "Infant Food",
+Category == "dip (dairy)" ~ "Dairy-based Dips",
+Category == "lemonade" ~ "Lemonade",
+Category == "beverage concentrate" ~ "Beverage Flavorings and Concentrates",
+.default = as.character(Category)), 
+.keep = "all") %>%
+  # impute missing values for pH, Brix, and aw with category average
+  group_by(MainCategory) %>%   
+  mutate(pH = ifelse(is.na(pH),  
+                     mean(pH, na.rm = T), 
+                     pH),
+         Brix = ifelse(is.na(Brix),  
+                       mean(Brix, na.rm = T), 
+                       Brix),
+         WaterActivity = ifelse(is.na(WaterActivity),
+                                mean(WaterActivity, na.rm = T),
+                                WaterActivity)) %>% 
+  ungroup()
+```
+
+# 4. Multinomial logistic regression
+```{r}
+# Load the modeling packages
+library(nnet)
+library(caret)
+
+# Load packages for creating model summary and descriptive statistics summary
+library(gtsummary)
+library(kableExtra)
+```
+
+# 4.1 Multinomial logistic regression: Ecoli
+```{r}
+# Check the structure of data
+str(hpp_df_logis)
+
+# Convert categorical variables to factors
+
+# hpp_df_logis$MainCategory <- as.factor(hpp_df_logis$MainCategory)
+# hpp_df_logis$DwellTimeRange <- as.factor(hpp_df_logis$DwellTimeRange)
+# hpp_df_logis$ProcessingTemperature <- as.factor(hpp_df_logis$ProcessingTemperature)
+# hpp_df_logis$Pressure <- as.factor(hpp_df_logis$Pressure)
+
+# Keep only the predictors and E.coli outcome
+
+hpp_df_logis$PassEcoli <- factor(hpp_df_logis$PassEcoli)
+
+# hpp_df_logis_Ecoli <-
+#   hpp_df_logis %>% select(c(MainCategory, Pressure,DwellTimeRange,ProcessingTemperature, pH, WaterActivity, Brix, PassEcoli)) %>%
+
+hpp_df_logis_Ecoli <-
+  hpp_df_logis %>% select(c(MainCategory, `Pressure(psi)`,DwellTimeRange,`ProcessingTemp(degC)`, pH, WaterActivity, Brix, PassEcoli)) %>%
+
+  # Scaling pressure, water activity and pH so that the 
+  # coefficients are more easily interpreted.
+  mutate(Pressure_kpsi = `Pressure(psi)`/1000,
+         WaterActivity_scaled = WaterActivity*10, 
+         pH_scaled = pH*10, 
+         .keep = "unused")
+
+#Split data into train and test set at 70:30 ratio
+
+set.seed(111)
+index <- createDataPartition(hpp_df_logis_Ecoli$PassEcoli, p = .7, list = FALSE)
+
+# Train set
+trainEcoli <- hpp_df_logis_Ecoli[index,]
+
+# Test set
+testEcoli <- hpp_df_logis_Ecoli[-index,]
+
+# Setting the baseline outcome
+
+trainEcoli$PassEcoli <- relevel(trainEcoli$PassEcoli, ref = "PassDetected")
+
+# Run the base model with every predictor
+
+base_Ecoli <- multinom(PassEcoli ~., data = trainEcoli)
+
+base_Ecoli$AIC
+base_Ecoli$deviance
+
+# Output model summary
+tbl_regression(base_Ecoli)
+```
+
+The base model for E.coli has AIC = `r base_Ecoli$AIC` and residual deviance = `r base_Ecoli$deviance`. Will adding interaction terms improve it ?
+```{r}
+new_Ecoli <- multinom(PassEcoli ~  pH_scaled*WaterActivity_scaled*Brix + Pressure_kpsi*DwellTimeRange, data = trainEcoli)
+
+new_Ecoli$AIC
+new_Ecoli$deviance
+
+# Output model summary
+tbl_regression(new_Ecoli)
+```
+
+The AIC of the new model is now `new_Ecoli$AIC`.
+
+Evaluate the E.coli model on the train set.
+
+```{r}
+# Predict the values for train dataset
+trainEcoli$Predicted <- predict(new_Ecoli, newdata = trainEcoli, "class")
+
+# Create a confusion matrix
+cm_Ecoli_train <- confusionMatrix(data = trainEcoli$Predicted, reference = trainEcoli$PassEcoli)
+
+cm_Ecoli_train
+```
+
+Evaluate the E.coli model on the test set.
+
+```{r}
+testEcoli$Predicted <- predict(new_Ecoli, newdata = testEcoli, "class")
+
+cm_Ecoli_test <- confusionMatrix(data = testEcoli$Predicted, reference = testEcoli$PassEcoli)
+
+cm_Ecoli_test
+
+```
+The kappa statistics suggests the model is 'in moderate agreement' with the truth. The model overall beats the no-info rate.
+
+Calculate Z score and p_value 
+Note: The calculated p-values matched with those in the output from tbl_regression() function despite the warning ;)
+
+```{r}
+ZEcoli <- summary(new_Ecoli)$coefficients/
+  summary(new_Ecoli)$standard.error
+
+pEcoli <- (1-pnorm(abs(ZEcoli),0,1))*2
+
+data.frame(t(pEcoli))
+```
+
+Calculate odd ratios
+
+```{R}
+# Odd ratios
+
+odds_ratios_Ecoli <- exp(summary(new_Ecoli)$coefficients)
+data.frame(t(odds_ratios_Ecoli))
+```
+
+# 4.2 Multinomial logistic regression: Salmonella
+```{r}
+# Need to change the validation outcome to factor
+hpp_df_logis$PassSalmonella <-
+  as.factor(hpp_df_logis$PassSalmonella)
+
+# Keep only the outcome for Salmonella
+hpp_df_logis_Salmonella <-
+  hpp_df_logis %>% select(c(MainCategory, `Pressure(psi)`,DwellTimeRange,`ProcessingTemp(degC)`, pH, WaterActivity, Brix, PassSalmonella)) %>%
+  
+  # Scale variables
+  mutate(Pressure_kpsi = `Pressure(psi)`/1000,
+         WaterActivity_scaled = WaterActivity*10, 
+         pH_scaled = pH*10, 
+         .keep = "unused")
+
+#Split data into train and test set
+
+set.seed(111)
+
+index <- createDataPartition(hpp_df_logis_Salmonella$PassSalmonella, p = .7, list = FALSE)
+
+trainSalmonella <- hpp_df_logis_Salmonella[index,]
+
+testSalmonella <- hpp_df_logis_Salmonella[-index,]
+```
+
+Run the base model with all predictors on the train dataset
+```{r}
+# Setting the baseline outcome
+trainSalmonella$PassSalmonella <- relevel(trainSalmonella$PassSalmonella, ref = "PassDetected")
+
+# Training the base multinomial model
+base_Salmonella <- multinom(PassSalmonella ~.,
+                           data = trainSalmonella)
+base_Salmonella$AIC
+
+base_Salmonella$deviance
+
+tbl_regression(base_Salmonella)
+```
+
+Trying a more complicated model with interaction terms
+```{r}
+new_Salmonella <- multinom(PassSalmonella ~  WaterActivity_scaled*pH_scaled*Brix + Pressure_kpsi*DwellTimeRange, data = trainSalmonella)
+
+new_Salmonella$AIC
+
+new_Salmonella$deviance
+
+tbl_regression(new_Salmonella)
+```
+
+Predicting the values for train dataset
+
+```{r}
+trainSalmonella$Predicted <- predict(new_Salmonella, newdata = trainSalmonella, "class")
+
+cm_Salmonella_train <- confusionMatrix(data = trainSalmonella$Predicted, reference = trainSalmonella$PassSalmonella)
+
+cm_Salmonella_train
+```
+
+Predicting the values for test dataset
+```{r}
+testSalmonella$Predicted <- predict(new_Salmonella, newdata = testSalmonella, "class")
+
+
+cm_Salmonella_test <- confusionMatrix(data = testSalmonella$Predicted, reference = testSalmonella$PassSalmonella)
+
+# Print confusion matrix & model performance
+cm_Salmonella_test
+```
+
+Calculate Z score and p_value
+```{r}
+ZSalmonella <- summary(new_Salmonella)$coefficients/summary(new_Salmonella)$standard.error
+
+pSalmonella <- (1-pnorm(abs(ZSalmonella),0,1))*2
+
+data.frame(t(pSalmonella))
+```
+
+Odd ratios
+```{r}
+odds_ratios_Salmonella <- exp(summary(new_Salmonella)$coefficients)
+
+data.frame(t(odds_ratios_Salmonella))
+```
+
+# 4.3 Multinomial logistic regression: Listeria
+```{r}
+# Need to change the validation outcome to factor
+hpp_df_logis$PassLmono <- as.factor(hpp_df_logis$PassLmono)
+
+#Split data into test and train set
+hpp_df_logis_Lmono <-
+  hpp_df_logis %>% select(c(MainCategory, `Pressure(psi)`,DwellTimeRange,`ProcessingTemp(degC)`, pH, WaterActivity, Brix, PassLmono)) %>%
+  mutate(Pressure_kpsi = `Pressure(psi)`/1000,
+         WaterActivity_scaled = WaterActivity*10, 
+         pH_scaled = pH*10, 
+         .keep = "unused")
+```
+
+
+```{r}
+# Split data to train & test set
+set.seed(11)
+index <- createDataPartition(hpp_df_logis_Lmono$PassLmono, p = .7, list = FALSE)
+trainLmono <- hpp_df_logis_Lmono[index,]
+testLmono <- hpp_df_logis_Lmono[-index,]
+
+# Setting the baseline
+trainLmono$PassLmono <- relevel(trainLmono$PassLmono, ref = "PassDetected")
+```
+
+Run a base model
+
+```{r}
+# base model
+base_Lmono <- multinom(PassLmono ~.,
+                           data = trainLmono)
+base_Lmono$AIC
+base_Lmono$deviance
+
+tbl_regression(base_Lmono)
+```
+
+The base model seems to perform the worst with Listeria data compared to other pathogens. We will fit another model that performed better for other pathogens
+Run a new model with interactions
+```{r}
+new_Lmono <- multinom(PassLmono ~  pH_scaled*WaterActivity_scaled*Brix+ Pressure_kpsi*DwellTimeRange, data = trainLmono)
+
+new_Lmono$AIC
+
+new_Lmono$deviance
+
+tbl_regression(new_Lmono)
+```
+
+
+```{r}
+# Predicting the values for train dataset
+trainLmono$Predicted <- predict(new_Lmono, newdata = trainLmono, "class")
+
+
+cm_Lmono_train <- confusionMatrix(data = trainLmono$Predicted, reference = trainLmono$PassLmono)
+
+cm_Lmono_train
+```
+
+```{r}
+testLmono$Predicted <- predict(new_Lmono, newdata = testLmono, "class")
+
+cm_Lmono_test <- confusionMatrix(data = testLmono$Predicted, reference = testLmono$PassLmono)
+
+cm_Lmono_test
+```
+
+Calculate Z score and p_value 
+```{r}
+ZLmono <- summary(new_Lmono)$coefficients/
+  summary(new_Lmono)$standard.error
+
+pLmono <- (1-pnorm(abs(ZLmono),0,1))*2
+t(exp(coef(new_Lmono)))
+
+data.frame(t(pLmono))
+```
+
+Odd ratios
+
+```{r}
+odds_ratios_Lmono <- exp(summary(new_Lmono)$coefficients)
+data.frame(t(odds_ratios_Lmono))
+```
+
+# 5. Taking a closer look at products that had failed validation studies
+
+```{r}
+# Use this package to stitch ggplot graphs
+library(patchwork)
+
+```
+
+5 out of 290 products failed validation for ALL pathogens
+```{r}
+hpp_df_logis %>% filter(PassEcoli == "Failed" & PassSalmonella=="Failed" & PassLmono == "Failed")
+```
+
+26 out of 290 products failed validation for at least 1 pathogen
+```{r}
+failed_df <- hpp_df_logis %>% filter(PassEcoli == "Failed" | PassSalmonella=="Failed" | PassLmono == "Failed")
+
+```
+
+Plotting grouped barplots to show which major cateogires had failures for which pathogens
+```{r}
+hpp_df_logis %>% pivot_longer(
+  cols = starts_with("Pass"),
+  names_to = "Pathogen",
+  names_prefix = "Pass",
+  values_to = "Outcome") %>%
+  filter(Outcome == "Failed") %>%
+  ggplot(aes(x = MainCategory, 
+             fill = Pathogen))+ 
+  geom_bar(position = "dodge")+
+  scale_fill_viridis_d(labels = c("E.coli","L.monocytogenes","S. enterica"))+
+  coord_flip()+
+  theme_classic()+
+  theme(text = element_text(family = "sans", size = 10), legend.text = element_text(face = "italic"))+
+  labs(x = "Main Category",
+       y = "Number of Products with \n Failed Validation Studies")
+```
+
+# 6. Descriptive statistics table
+
+```{r}
+summary_table <- hpp_df_logis %>%
+   mutate(ProcessingTemperature = case_when(
+     `ProcessingTemp(degC)` == 5 ~ "5 degrees C",
+     `ProcessingTemp(degC)`> 5 &
+       `ProcessingTemp(degC)`<= 10 ~ "Between 5-10 degrees C"),
+     # `ProcessingTemp(degC)`>10 ~ "Above 10 degrees C"),
+     # Pressure = case_when(
+     #   `Pressure(psi)`<= 80000 ~ "Between 50,000 to 80,000 psi",
+     #   `Pressure(psi)` > 80000 ~ "Between 80,0001 to 87,000 psi"), 
+     .keep = "unused") %>%
+  
+  select(c(MainCategory, 
+           pH, 
+           Brix, 
+           WaterActivity,
+           `Pressure(psi)`,
+           DwellTimeRange,
+           ProcessingTemperature, 
+           LR_Ecoli,
+           LR_Salmonella,
+           LR_Lmonocytogenes,
+           PassEcoli,
+           PassSalmonella,
+           PassLmono)) %>%
+  pivot_longer(cols = starts_with("Pass"),names_to = "Pathogen",
+               names_prefix = "Pass", values_to = "Outcome") %>% tbl_strata(
+    strata = Pathogen,
+    .tbl_fun = ~.x %>%
+      tbl_summary(
+        by = Outcome,
+        statistic = list(all_continuous() ~ "{mean} ({sd})",
+                         all_categorical() ~ "{n} ({p}%)"),
+             #type = list(where(is.logical) ~ "categorical"),
+             label = list(MainCategory ~ "Product Category",
+                          WaterActivity ~ "Water Activity",
+                          DwellTimeRange ~ "Dwell Time",
+                          ProcessingTemperature ~ 
+                            "HPP Temperature",
+                LR_Ecoli ~ "Log Reduction in E. coli O157:H7 after HPP",
+           LR_Salmonella ~ "Log Reduction in Salmonella after HPP",
+           LR_Lmonocytogenes ~ "Log Reduction in L. monocytogenes after HPP"),
+             missing_text = "Data not collected"),
+    .header = "**{strata}**, N = {n}"
+  )
+
+
+summary_table
+```
+
+# 7. Data visualization
+
+```{r include=FALSE}
+hpp_df_plot <- hpp_df %>% 
+  select(!(Date)) %>%
+  filter(Time %in% 
+           c("BeforeHPP", "AfterHPP")) %>%
+  pivot_wider(names_from = Time, 
+              values_from = c(Ecoli, Salmonella, Lmonocytogenes)) %>% 
+  mutate(LR_Ecoli = Ecoli_BeforeHPP-Ecoli_AfterHPP,
+         LR_Salmonella = Salmonella_BeforeHPP-Salmonella_AfterHPP,
+         LR_Lmonocytogenes = Lmonocytogenes_BeforeHPP - Lmonocytogenes_AfterHPP) %>%
+  
+  # Further categorize post-HPP plate counts to 
+      #1) nondetects (recorded as 0) - "passed"
+      #2) detected with 5 log reduction achieved 
+      #3) detected with 5 log reduction NOT achieved - "failed"
+  mutate(
+    PassLmono = case_when(
+    Lmonocytogenes_AfterHPP == 0 ~ "PassNonDetected",
+    eval(LR_Lmonocytogenes < 5) ~ "Failed",
+    .default = "PassDetected")) %>%
+  mutate(
+    PassEcoli = case_when(
+    Ecoli_AfterHPP == 0 ~ "PassNonDetected",
+    LR_Ecoli < 5 ~ "Failed",
+    .default = "PassDetected")) %>%
+  mutate(
+    PassSalmonella = case_when(
+    Salmonella_AfterHPP == 0 ~ "PassNonDetected",
+    LR_Salmonella < 5 ~ "Failed",
+    .default = "PassDetected")) %>%
+  mutate(MainCategory = case_when(
+    Category == "almond milk" | Category == "lactose-free non-dairy beverage" ~ "Dairy alternatives (including nut and eggs)",
+    # Combine sub-categories 
+    Category == "apple cider (non-alcoholic)" | Category == "apple juice" | Category == "celery juice" |
+    Category == "cherry juice" |
+    Category == "citrus juice" |
+    Category == "coconut water" |
+    Category == "grape juice" |
+    Category == "grapefruit juice" |
+    Category == "mixed fruit and vegetable juices" |
+    Category == "orange juice" |
+    Category == "watermelon juice" ~ "Juices and Non-alcoholic Ciders",
+    Category == "gazpacho" |
+    Category == "fruit or fruit-vegetable puree" |
+    Category == "fruit puree" |
+    Category == "fruit smoothies" |
+    Category == "mango food product" |
+    Category == "fruit salad" ~ "Fruit and Vegetable Purees or Smoothies",
+    Category == "barbeque sauce" |
+     Category == "harissa chili paste"|
+     Category == "herbs, vegetables and oil sauces" |
+     Category == "salsa" |
+     Category == "indian chutney" |
+     Category == "marinara sauce" |
+     Category == "pesto sauce" |
+     Category == "sauce" |
+     Category == "seasoning (citrus juice based)" |
+     Category == "vinaigrette dressing food product" ~ "Sauces, Salsas, Vinaigrettes and Marinades",
+Category == "bean (cooked)" |
+Category == "dip (nondairy)" |
+Category == "hummus"  ~ "Hummus and other bean dips",
+Category == "coffee beverage"|
+Category == "tea based beverage product" ~ "Coffee- and Tea-based Beverages",
+Category =="crabmeat (cooked)" | 
+  Category == "meat (cured)"|
+  Category == "pancetta"|
+  Category == "plant based meat product analog" ~ "Meat, Seafood, or Analogs",
+Category == "tuna salad"| 
+  Category == "prepared pasta salad"|
+  Category == "meal (ready-to-consume)" ~ "RTE Meal or Salad",
+Category == "vegetable and meat infant food" | 
+Category == "infant food (pureed)"~ "Infant Food",
+Category == "dip (dairy)" ~ "Dairy-based Dips",
+Category == "lemonade" ~ "Lemonade",
+Category == "beverage concentrate" ~ "Beverage Flavorings and Concentrates",
+.default = as.character(Category)), 
+.keep = "all") %>%
+  # impute missing values for pH, Brix, and aw with category average
+  group_by(MainCategory) %>%   
+  mutate(pH = ifelse(is.na(pH),  
+                     mean(pH, na.rm = T), 
+                     pH),
+         Brix = ifelse(is.na(Brix),  
+                       mean(Brix, na.rm = T), 
+                       Brix),
+         WaterActivity = ifelse(is.na(
+           WaterActivity),mean(WaterActivity, 
+               na.rm = T), WaterActivity)) %>% 
+  ungroup()
+```
+
+```{r}
+hpp_df_plot %>% 
+  pivot_longer(
+    cols = starts_with("Pass"),
+    names_to = "Pathogen",
+    names_prefix = "Pass", 
+    values_to = "Outcome") %>%
+    
+  ggplot(aes(x = `DwellTime(s)`, 
+             y = `Pressure(psi)`/1000))+
+  geom_jitter(aes(color = pH,
+                  shape = Outcome), 
+              size = 3, 
+              alpha = 0.5) + scale_color_viridis_c(direction = -1) +
+  facet_wrap(
+    vars(MainCategory),         
+    scales = "free_y",
+    labeller = labeller(
+      MainCategory = label_wrap_gen(width=15)))+
+  labs(y = "Pressure(x 1000 psi",
+       x = "Dwell Time (s)")+
+  theme_bw()
+  
+```
+
+
+
+##  Statistical analysis (by Luke, Code not run for this report)
+### linear regression using log reduction as outcome
+### logistic regression using passing validation as outcome
+```{r eval=FALSE, include=FALSE}
+#logRed_df_long = logRed_df %>% 
+#   pivot_longer(c(LogReductionEcoli, LogReductionSalmonella, LogReductionLmono), 
+#            names_to = "Bacteria",
+#                values_to = "LogReduction") %>% 
+#   mutate(Bacteria = case_when(Bacteria == "LogReductionEcoli" ~ "Ecoli",
+#                               Bacteria == "LogReductionSalmonella" ~ "Salmonella",
+#                               Bacteria == "LogReductionLmono"~ "Lmono"))
+
+# Total
+#lm_fit = lm(LogReduction ~ Pressure + DwellTime + ProcessingTemp + pH + WaterActivity + Brix +
+#                 Bacteria + Pressure*pH, data = logRed_df_long)
+#lm_fit %>% summary()
+
+# Ecoli
+lm_Ecoli = lm(LogReductionEcoli ~ Pressure + DwellTime + ProcessingTemp + pH + WaterActivity + Brix +
+                 Pressure*pH, data = logRed_df)
+glm_Ecoli = lm(as.numeric(PassEcoli) ~ Pressure + DwellTime + ProcessingTemp + pH + WaterActivity + Brix +
+                 Pressure*pH, data = logRed_df)
+   
+lm_Ecoli %>% summary()
+glm_Ecoli %>% summary()
+exp(coef(glm_Ecoli))
+
+# Salmonella
+lm_Salmonella = lm(LogReductionSalmonella ~ Pressure + DwellTime + ProcessingTemp + pH + WaterActivity + Brix +
+                 Pressure*pH, data = logRed_df)
+glm_Salmonella = lm(as.numeric(PassSalmonella) ~ Pressure + DwellTime + ProcessingTemp + pH + WaterActivity + Brix +
+                 Pressure*pH, data = logRed_df)
+
+lm_Salmonella %>% summary()
+glm_Salmonella %>% summary()
+exp(coef(glm_Salmonella))
+
+
+# Lmono
+lm_Lmono = lm(LogReductionLmono ~ Pressure + DwellTime + ProcessingTemp + pH + WaterActivity + Brix +
+                 Pressure*pH, data = logRed_df)
+glm_Lmono = lm(as.numeric(PassLmono) ~ Pressure + DwellTime + ProcessingTemp + pH + WaterActivity + Brix +
+                 Pressure*pH, data = logRed_df)
+
+lm_Lmono %>% summary()
+glm_Lmono %>% summary()
+exp(coef(glm_Lmono))
+
+```
+
+##  Regression with CART and xgboost
+```{r eval=FALSE, include=FALSE}
+library(tidymodels)
+set.seed(1)
+
+## Set up training and testing sets
+logRed_split= initial_split(logRed_df, prop = 0.7)
+
+logRed_train = training(logRed_split)
+logRed_test = testing(logRed_split)
+
+## Set up resampling approach
+logRed_folds = vfold_cv(logRed_train , v = 5)
+
+## Create a recipe
+logRed_recipe = recipe(LogReductionLmono ~ ., data = logRed_train) %>% 
+  update_role(Product,  Ingredients, Time, Date, 
+              LogReductionEcoli, LogReductionSalmonella,
+              Ecoli, Salmonella, Lmonocytogenes, 
+              PassEcoli, PassSalmonella, PassLmono, new_role = "Non-predictor") %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+  step_other(all_nominal_predictors(), threshold = 0.05) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  step_zv(all_predictors())
+
+## Set up spec for model
+cart_spec = 
+   decision_tree(cost_complexity = tune(), min_n = tune()) %>% 
+   set_engine("rpart") %>% 
+   set_mode("regression")
+
+xgb_spec = 
+   boost_tree(tree_depth = tune(), learn_rate = tune(), loss_reduction = tune(), 
+              min_n = tune(), sample_size = tune(), trees = tune()) %>% 
+   set_engine("xgboost") %>% 
+   set_mode("regression")
+
+## Set up workflows
+cart_wf = workflow(logRed_recipe, cart_spec)
+xgb_wf = workflow(logRed_recipe, xgb_spec)
+
+
+## Model training
+library(finetune)
+doParallel::registerDoParallel()
+
+cart_rs = tune_race_anova(
+  cart_wf,
+  logRed_folds,
+  grid = 40,
+  metrics = metric_set(rsq),
+  control = control_race(verbose_elim = T)
+  )
+
+xgb_rs = tune_race_anova(
+  xgb_wf,
+  logRed_folds,
+  grid = 40,
+  metrics = metric_set(rsq),
+  control = control_race(verbose_elim = T)
+  )
+
+## Show training results
+plot_race(cart_rs)
+show_best(cart_rs, metric = "rsq")
+show_best(xgb_rs, metric = "rsq")
+
+
+## Finalize the trained model
+cart_last = 
+  cart_wf %>% 
+  finalize_workflow(select_best(cart_rs, "rsq")) %>% 
+  last_fit(logRed_split)
+xgb_last = 
+  xgb_wf %>% 
+  finalize_workflow(select_best(xgb_rs, "rsq")) %>% 
+  last_fit(logRed_split)
+
+cart_last %>% 
+  collect_predictions() %>% 
+  rsq(LogReductionLmono,.pred)
+xgb_last %>% 
+  collect_predictions() %>% 
+  rsq(LogReductionLmono,.pred)
+
+## Plot the prediction vs. truth
+cart_last %>% 
+  collect_predictions() %>% 
+  ggplot(aes(x = LogReductionLmono, y =.pred)) +
+  geom_point() +
+  theme_classic()
+xgb_last %>% 
+  collect_predictions() %>% 
+  ggplot(aes(x = LogReductionLmono, y =.pred)) +
+  geom_point() +
+  theme_classic()
+
+## Variable importance plot
+library(vip)
+extract_workflow(cart_last) %>% 
+  extract_fit_parsnip() %>% 
+  vip(geom = "point", num_features = 15) 
+extract_workflow(xgb_last) %>% 
+  extract_fit_parsnip() %>% 
+  vip(geom = "point", num_features = 15) 
+```
+
+## Classification with CART and xgboost (highly subject to class imbalance)
+```{r eval=FALSE, include=FALSE}
+library(tidymodels)
+library(themis)
+set.seed(1)
+
+## Set up training and testing sets
+logRed_split= initial_split(logRed_df, prop = 0.7, strata = PassEcoli)
+
+logRed_train = training(logRed_split)
+logRed_test = testing(logRed_split)
+
+## Set up resampling approach
+logRed_folds = vfold_cv(logRed_train , strata = PassEcoli, v = 5)
+
+## Create a recipe
+logRed_recipe = recipe(PassEcoli ~ ., data = logRed_train) %>% 
+  update_role(Product,  Ingredients, Time, Date, 
+              LogReductionEcoli, LogReductionSalmonella, LogReductionLmono,
+              Ecoli, Salmonella, Lmonocytogenes
+              , PassSalmonella, PassLmono, new_role = "Non-predictor") %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+  step_other(all_nominal_predictors(), threshold = 0.05) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  step_zv(all_predictors()) %>% 
+  step_rose(PassEcoli, seed = 1)
+
+## Set up spec for model
+cart_spec = 
+   decision_tree(cost_complexity = tune(), min_n = tune()) %>% 
+   set_engine("rpart") %>% 
+   set_mode("classification")
+
+xgb_spec = 
+   boost_tree(tree_depth = tune(), learn_rate = tune(), loss_reduction = tune(), 
+              min_n = tune(), sample_size = tune(), trees = tune()) %>% 
+   set_engine("xgboost") %>% 
+   set_mode("classification")
+
+## Set up workflows
+cart_wf = workflow(logRed_recipe, cart_spec)
+xgb_wf = workflow(logRed_recipe, xgb_spec)
+
+
+## Model training
+library(finetune)
+doParallel::registerDoParallel()
+
+cart_rs = tune_race_anova(
+  cart_wf,
+  logRed_folds,
+  grid = 40,
+  metrics = metric_set(accuracy),
+  control = control_race(verbose_elim = T)
+  )
+
+xgb_rs = tune_race_anova(
+  xgb_wf,
+  logRed_folds,
+  grid = 40,
+  metrics = metric_set(accuracy),
+  control = control_race(verbose_elim = T)
+  )
+
+## Show training results
+plot_race(cart_rs)
+show_best(cart_rs, metric = "accuracy")
+show_best(xgb_rs, metric = "accuracy")
+
+
+## Finalize the trained model
+cart_last = 
+  cart_wf %>% 
+  finalize_workflow(select_best(cart_rs, "accuracy")) %>% 
+  last_fit(logRed_split)
+xgb_last = 
+  xgb_wf %>% 
+  finalize_workflow(select_best(xgb_rs, "accuracy")) %>% 
+  last_fit(logRed_split)
+
+cart_last %>% 
+  collect_predictions() %>% 
+  conf_mat(PassEcoli,.pred_class)
+xgb_last %>% 
+  collect_predictions() %>% 
+  conf_mat(PassEcoli,.pred_class)
+
+## Variable importance plot
+library(vip)
+extract_workflow(cart_last) %>% 
+  extract_fit_parsnip() %>% 
+  vip(geom = "point", num_features = 15) 
+extract_workflow(xgb_last) %>% 
+  extract_fit_parsnip() %>% 
+  vip(geom = "point", num_features = 15) 
+```
+
+## Regression with worflow set (most models failed)
+```{r eval=FALSE, include=FALSE}
+library(tidymodels)
+set.seed(1)
+
+logRed_split= initial_split(logRed_df, prop = 0.7)
+
+logRed_train = training(logRed_split)
+logRed_test = testing(logRed_split)
+
+logRed_folds = vfold_cv(logRed_train , v = 5)
+
+## Create a recipe
+logRed_recipe = recipe(LogReductionEcoli ~ ., data = logRed_train) %>% 
+  update_role(Product, Category, Ingredients, Time, Date, 
+              LogReductionSalmonella, LogReductionLmono,
+              Ecoli, Salmonella, Lmonocytogenes, 
+              PassEcoli, PassSalmonella, PassLmono, new_role = "Non-predictor") %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+  step_other(threshold = 0.2) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  step_zv(all_predictors())
+
+## Set tuning specs
+linear_reg_spec =
+   linear_reg(penalty = tune(), mixture = tune()) %>% 
+   set_engine("glmnet")
+
+#nnet_spec = 
+#   mlp(hidden_units = tune(), penalty = tune(), epochs = tune()) %>% 
+#   set_engine("nnet", MaxNWts = 2600) %>% 
+#   set_mode("regression")
+
+cart_spec = 
+   decision_tree(cost_complexity = tune(), min_n = tune()) %>% 
+   set_engine("rpart") %>% 
+   set_mode("regression")
+
+svm_r_spec = 
+   svm_rbf(cost = tune(), rbf_sigma = tune()) %>% 
+   set_engine("kernlab") %>% 
+   set_mode("regression")
+
+svm_p_spec = 
+   svm_poly(cost = tune(), degree = tune()) %>% 
+   set_engine("kernlab") %>% 
+   set_mode("regression")
+
+rf_spec =
+   rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>% 
+   set_engine("ranger") %>% 
+   set_mode("regression")
+
+xgb_spec = 
+   boost_tree(tree_depth = tune(), learn_rate = tune(), loss_reduction = tune(), 
+              min_n = tune(), sample_size = tune(), trees = tune()) %>% 
+   set_engine("xgboost") %>% 
+   set_mode("regression")
+
+
+logRed_wfset <- 
+   workflow_set(
+      preproc = list(logRed_ecoli = logRed_recipe), 
+      models = list(
+                    Linear = linear_reg_spec,
+                    SVM_radial = svm_r_spec, 
+                    SVM_poly = svm_p_spec,
+                    CART = cart_spec,
+                    RF = rf_spec, 
+                    boosting = xgb_spec))
+
+
+#cart_wf = workflow(logRed_recipe, cart_spec)
+
+## Model tuning
+library(finetune)
+doParallel::registerDoParallel()
+
+race_ctrl =
+   control_race(
+      save_pred = TRUE,
+      parallel_over = "everything",
+      save_workflow = TRUE
+   )
+
+race_results =
+   logRed_wfset %>%
+   workflow_map(
+      "tune_race_anova",
+      seed = 1,
+      resamples = logRed_folds,
+      grid = 25,
+      control = race_ctrl,
+      metrics = metric_set(rsq)
+   )
+
+#cart_rs = tune_race_anova(
+#  cart_wf,
+#  logRed_folds,
+#  grid = 40,
+#  metrics = metric_set(rsq),
+#  control = control_race(verbose_elim = T)
+#  )
+
+## plot the results
+autoplot(
+   race_results,
+   rank_metric = "rsq",  
+   metric = "rsq",       
+   select_best = TRUE    
+) +
+   geom_text(aes(y = mean - 1/2, label = wflow_id), angle = 90, hjust = 1) +
+   lims(y = c(0, 1)) +
+   theme(legend.position = "none")
+```
+
+
+# Session information
+```{r session-info}
+devtools::session_info()
+```
+
